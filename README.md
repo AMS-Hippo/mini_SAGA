@@ -1,4 +1,6 @@
-A very simple and vibe-coded point-cloud similarity score, based loosely on Steve Knox's presentation "Extending pairwise element similarity to set similarity efficiently".
+A very simple and vibe-coded point-cloud similarity score, based loosely on Steve Knox's presentation "Extending pairwise element similarity to set similarity efficiently". I also include a short notebook illustrating how this works for a sort of prototypical time series anomaly detection example.  
+
+
 
 I'm a little bit sceptical of this actually being a good score, for a few reasons:
 
