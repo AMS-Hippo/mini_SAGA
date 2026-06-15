@@ -1,30 +1,25 @@
 """
-Efficient computation of
+Efficient computation of point-cloud similarity from 0-dimensional linkage trees.
+
+The basic score is
 
     s(X, Y) = (I(X) + I(Y) - I(X union Y)) / I(X union Y)
 
 where I(Z) = int_0^R C_r(Z) dr and R is the first radius at which both
-G_R(X) and G_R(Y) are connected.
+X and Y are connected.  C_r(Z) is determined by the Euclidean MST / single
+linkage tree.
 
-The core observation is that C_r is determined by the Euclidean MST /
-single-linkage tree.  If R is at least the connectivity threshold of Z,
+The preferred API for sliding-window use is the index-set API:
 
-    I(Z) = R + total_weight(MST(Z)).
+    pointcloud_similarity_index_sets(points, indices_X, indices_Y)
+    pointcloud_similarity_from_common_indices(points, common_indices, x_index=..., y_index=...)
 
-For X,Y differing by at most one deletion and one insertion, write
-A = X cap Y, X = A + x, Y = A + y.  Compute MST(A) once, then get MST(X),
-MST(Y), and MST(A+x+y) from MST(A) plus only the star edges incident to the
-new point(s).  This is exact if MST(A) is exact.
+The optimized path assumes at most one index in X\\Y and at most one index in
+Y\\X.  The original two-array API is kept as pointcloud_similarity_one_swap.
 
-Preferred high-level API for streaming/sliding-window data:
-
-    pointcloud_similarity_indices(points, indices_X, indices_Y, ...)
-    pointcloud_similarity_index_sets(points, indices_X, indices_Y, ...)  # alias
-
-where X = points[indices_X] and Y = points[indices_Y].  A two-array
-compatibility API is also provided:
-
-    pointcloud_similarity_one_swap(X, Y, ...)
+Weighted integral modes are available through measure=... without changing the
+default behavior.  Supported kinds are: plain, exponential, size_weighted,
+min_size, and effective.
 
 Dependencies: numpy, scipy.
 """
@@ -33,9 +28,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+
+__version__ = "0.5.1"
 
 
 @dataclass
@@ -58,7 +55,7 @@ class MSTResult:
 
 @dataclass
 class SimilarityResult:
-    """Result object returned by the high-level similarity routines."""
+    """Result returned by the point-cloud similarity functions."""
 
     s: float
     R: float
@@ -72,11 +69,64 @@ class SimilarityResult:
     n_common: int
     x_unique: Optional[np.ndarray]
     y_unique: Optional[np.ndarray]
-    common_indices: Optional[np.ndarray] = None
     x_unique_index: Optional[int] = None
     y_unique_index: Optional[int] = None
-    indices_X: Optional[np.ndarray] = None
-    indices_Y: Optional[np.ndarray] = None
+    measure_kind: str = "plain"
+    measure_info: Optional[dict[str, Any]] = None
+
+
+class SimilarityIntegrals(dict):
+    """Dict-like result that also supports legacy tuple unpacking.
+
+    Mapping-style access:
+
+        vals["s"], vals["I_X"], vals["measure_info"]
+
+    Legacy notebook access:
+
+        I_X, I_Y, I_union, info = vals
+    """
+
+    def __iter__(self):
+        # Compatibility with the first weighted notebook draft.
+        yield self["I_X"]
+        yield self["I_Y"]
+        yield self["I_union"]
+        yield self["measure_info"]
+
+    @property
+    def s(self) -> float:
+        return float(self["s"])
+
+    @property
+    def R(self) -> float:
+        return float(self["R"])
+
+    @property
+    def I_X(self) -> float:
+        return float(self["I_X"])
+
+    @property
+    def I_Y(self) -> float:
+        return float(self["I_Y"])
+
+    @property
+    def I_union(self) -> float:
+        return float(self["I_union"])
+
+    @property
+    def measure_kind(self) -> str:
+        return str(self["measure_kind"])
+
+    @property
+    def measure_info(self) -> dict[str, Any]:
+        return dict(self["measure_info"])
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self)
+
+    def as_legacy_tuple(self) -> tuple[float, float, float, dict[str, Any]]:
+        return (self.I_X, self.I_Y, self.I_union, self.measure_info)
 
 
 class UnionFind:
@@ -85,8 +135,8 @@ class UnionFind:
     __slots__ = ("parent", "rank", "count")
 
     def __init__(self, n: int):
-        self.parent = np.arange(n, dtype=np.int64)
-        self.rank = np.zeros(n, dtype=np.uint8)
+        self.parent = np.arange(int(n), dtype=np.int64)
+        self.rank = np.zeros(int(n), dtype=np.uint8)
         self.count = int(n)
 
     def find(self, x: int) -> int:
@@ -195,7 +245,7 @@ def _ckdtree_query(tree, query_points: np.ndarray, k: int, eps: float, workers: 
     """Compatibility wrapper for scipy versions with/without workers=."""
     try:
         return tree.query(query_points, k=k, eps=eps, workers=workers)
-    except TypeError:  # pragma: no cover - old scipy compatibility
+    except TypeError:
         return tree.query(query_points, k=k, eps=eps)
 
 
@@ -209,13 +259,11 @@ def emst_boruvka_ckdtree(
     max_query_entries: int = 2_000_000,
 ) -> MSTResult:
     """
-    Euclidean MST via Boruvka phases and cKDTree kNN queries.
+    Euclidean MST using Boruvka phases and cKDTree kNN queries.
 
-    With eps=0.0, cKDTree nearest-neighbor queries are exact.  The method avoids
-    O(n^2) pairwise distances and is typically near-linear for low/moderate
-    dimensional geometric data, but KD-tree methods can degrade in high
-    dimension or on adversarial inputs.  Setting eps>0 trades exactness for
-    approximate nearest-neighbor speed.
+    This avoids O(n^2) pairwise distances. It is exact when eps=0.0, assuming
+    exact cKDTree queries. Like all KD-tree methods, performance can degrade in
+    high dimension or adversarial configurations.
     """
     pts = _as_points(points)
     n = pts.shape[0]
@@ -255,8 +303,8 @@ def emst_boruvka_ckdtree(
                 src = unresolved[start : start + chunk_size]
                 dists, idxs = _ckdtree_query(tree, pts[src], k_eff, eps, workers)
                 if k_eff == 1:
-                    dists = np.asarray(dists)[:, None]
-                    idxs = np.asarray(idxs)[:, None]
+                    dists = dists[:, None]
+                    idxs = idxs[:, None]
                 else:
                     dists = np.asarray(dists)
                     idxs = np.asarray(idxs)
@@ -291,8 +339,6 @@ def emst_boruvka_ckdtree(
         ds = nearest_d[valid]
         roots = labels[srcs]
 
-        # Pick the lightest outgoing edge for each component.  Lexicographic
-        # tie-breaking makes results deterministic.
         order = np.lexsort((dsts, srcs, ds, roots))
         roots_sorted = roots[order]
         first = np.r_[True, roots_sorted[1:] != roots_sorted[:-1]]
@@ -325,9 +371,8 @@ def emst_delaunay(points: np.ndarray, *, qhull_options: Optional[str] = None) ->
     """
     Exact Euclidean MST from the Delaunay graph.
 
-    Best for low-dimensional data, especially 2D.  In high dimensions the
-    Delaunay graph can be much larger than linear or Qhull may fail on
-    degeneracies.  Duplicate rows are handled by the Boruvka routine instead.
+    Best for low-dimensional data, especially 2D. Duplicate points are handled
+    by the Boruvka routine instead.
     """
     pts = _as_points(points)
     n, d = pts.shape
@@ -341,11 +386,10 @@ def emst_delaunay(points: np.ndarray, *, qhull_options: Optional[str] = None) ->
         w = np.abs(pts[v, 0] - pts[u, 0])
         return kruskal_mst(n, u, v, w, assume_sorted=True)
 
-    # For tiny clouds, the complete graph is still small and exact.
     if n <= d + 1:
-        us = []
-        vs = []
-        ws = []
+        us: list[int] = []
+        vs: list[int] = []
+        ws: list[float] = []
         for i in range(n):
             for j in range(i + 1, n):
                 us.append(i)
@@ -353,7 +397,6 @@ def emst_delaunay(points: np.ndarray, *, qhull_options: Optional[str] = None) ->
                 ws.append(float(np.linalg.norm(pts[i] - pts[j])))
         return kruskal_mst(n, us, vs, ws)
 
-    # Qhull can be awkward with duplicate rows; cKDTree Boruvka handles them.
     if np.unique(pts, axis=0).shape[0] != n:
         return emst_boruvka_ckdtree(pts)
 
@@ -374,7 +417,10 @@ def emst_delaunay(points: np.ndarray, *, qhull_options: Optional[str] = None) ->
             a = int(simplex[a_pos])
             for b_pos in range(a_pos + 1, simplex_width):
                 b = int(simplex[b_pos])
-                edges.add((a, b) if a < b else (b, a))
+                if a < b:
+                    edges.add((a, b))
+                else:
+                    edges.add((b, a))
 
     if not edges:
         return emst_boruvka_ckdtree(pts)
@@ -393,14 +439,7 @@ def emst(
     delaunay_max_dim: int = 3,
     **kwargs,
 ) -> MSTResult:
-    """
-    Convenience Euclidean MST builder.
-
-    method="auto": use Delaunay for dimension <= delaunay_max_dim, otherwise
-    use cKDTree Boruvka.
-    method="delaunay": force Delaunay.
-    method="boruvka": force cKDTree Boruvka.
-    """
+    """Convenience Euclidean MST builder."""
     pts = _as_points(points)
     method = method.lower()
     if method == "auto":
@@ -411,13 +450,14 @@ def emst(
                     **{k: v for k, v in kwargs.items() if k == "qhull_options"},
                 )
             except Exception:
-                # Robust fallback for degenerate low-dimensional inputs.
                 pass
         return emst_boruvka_ckdtree(
             pts,
-            **{k: v for k, v in kwargs.items() if k in {
-                "initial_k", "leafsize", "eps", "workers", "max_query_entries"
-            }},
+            **{
+                k: v
+                for k, v in kwargs.items()
+                if k in {"initial_k", "leafsize", "eps", "workers", "max_query_entries"}
+            },
         )
     if method == "delaunay":
         return emst_delaunay(pts, **kwargs)
@@ -432,14 +472,10 @@ def mst_with_inserted_points(
     inserted_points: Optional[np.ndarray],
 ) -> MSTResult:
     """
-    Compute MST(A plus inserted points) from MST(A) plus inserted star edges.
+    Compute MST(A plus inserted points) from MST(A) plus inserted candidate edges.
 
-    For k inserted points this uses candidate edges:
-      - all edges of MST(A)
-      - every edge from each inserted point to every point in A
-      - every edge between inserted points
-
-    For the target use case k <= 2, so this is O(n d + n log n) after MST(A).
+    Candidate edges are MST(A), all edges from each inserted point to A, and all
+    edges among inserted points. This is exact for a fixed exact MST(A).
     """
     A = _as_points(common_points, "common_points")
     if inserted_points is None:
@@ -475,9 +511,9 @@ def mst_with_inserted_points(
             w_parts.append(np.linalg.norm(A - p, axis=1))
 
     if k > 1:
-        us = []
-        vs = []
-        ws = []
+        us: list[int] = []
+        vs: list[int] = []
+        ws: list[float] = []
         for a in range(k):
             for b in range(a + 1, k):
                 us.append(nA + a)
@@ -504,13 +540,400 @@ def integral_from_mst(mst: MSTResult, R: float) -> float:
     return float(mst.n * R - np.maximum(0.0, R - weights).sum(dtype=np.float64))
 
 
-def component_counts_from_mst(mst: MSTResult, radii: Sequence[float] | np.ndarray) -> np.ndarray:
-    """Evaluate C_r for many radii from MST/single-linkage merge radii."""
-    r = np.asarray(radii, dtype=np.float64)
-    if np.any(r < 0):
-        raise ValueError("radii must be nonnegative")
-    weights = np.sort(np.asarray(mst.w, dtype=np.float64))
-    return mst.n - np.searchsorted(weights, r, side="right")
+# ---------------------------------------------------------------------------
+# Weighted integral modes
+# ---------------------------------------------------------------------------
+
+
+def _positive_scale_from_values(values: np.ndarray, quantile: float, default: float = 1.0) -> float:
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        return float(default)
+    scale = float(np.quantile(vals, quantile))
+    if not np.isfinite(scale) or scale <= 0:
+        return float(default)
+    return scale
+
+
+def _median_nearest_neighbor_distance(points: np.ndarray) -> float:
+    pts = _as_points(points, "points_for_scale")
+    n = pts.shape[0]
+    if n <= 1:
+        return 1.0
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(pts)
+        dists, _ = _ckdtree_query(tree, pts, k=min(2, n), eps=0.0, workers=-1)
+        dists = np.asarray(dists, dtype=np.float64)
+        nn = dists if dists.ndim == 1 else dists[:, 1]
+        return _positive_scale_from_values(nn, 0.5, default=1.0)
+    except Exception:
+        best = np.full(n, np.inf, dtype=np.float64)
+        for i in range(n):
+            d = np.linalg.norm(pts - pts[i], axis=1)
+            d[i] = np.inf
+            best[i] = np.min(d)
+        return _positive_scale_from_values(best, 0.5, default=1.0)
+
+
+def _normalise_measure(measure: Any) -> dict[str, Any]:
+    if measure is None:
+        return {"kind": "plain"}
+    if isinstance(measure, str):
+        key = measure.strip().lower().replace("-", "_")
+        aliases = {
+            "unweighted": "plain",
+            "original": "plain",
+            "count": "plain",
+            "exp": "exponential",
+            "exponential_radial": "exponential",
+            "size": "size_weighted",
+            "size_weight": "size_weighted",
+            "size_weighted_count": "size_weighted",
+            "size_weighted_counts": "size_weighted",
+            "minimum_size": "min_size",
+            "minimum_size_count": "min_size",
+            "min_size_count": "min_size",
+            "effective_components": "effective",
+            "effective_number": "effective",
+            "entropy": "effective",
+        }
+        return {"kind": aliases.get(key, key)}
+    if isinstance(measure, Mapping):
+        spec = dict(measure)
+        kind = str(spec.get("kind", "plain")).strip().lower().replace("-", "_")
+        spec["kind"] = _normalise_measure(kind)["kind"]
+        return spec
+    raise TypeError("measure must be a string, mapping, or None")
+
+
+def _resolve_exponential_lambda(
+    spec: Mapping[str, Any],
+    *,
+    mst_union: MSTResult,
+    points_for_scale: Optional[np.ndarray] = None,
+) -> tuple[float, dict[str, Any]]:
+    for key in ("lambda", "lambda_", "lam"):
+        if key in spec and spec[key] is not None:
+            lam = float(spec[key])
+            if not np.isfinite(lam) or lam < 0:
+                raise ValueError("exponential lambda must be finite and nonnegative")
+            return lam, {"kernel": "exponential", "lambda": lam, "scale": None, "half_life": False}
+
+    scale_spec = spec.get("scale", "median_mst_union")
+    if isinstance(scale_spec, str):
+        scale_name = scale_spec.strip().lower().replace("-", "_")
+        if scale_name in {"median_mst", "median_mst_union", "mst_median"}:
+            scale = _positive_scale_from_values(mst_union.w, 0.5, default=1.0)
+        elif scale_name in {"p90_mst", "p90_mst_union", "mst_p90"}:
+            scale = _positive_scale_from_values(mst_union.w, 0.9, default=1.0)
+        elif scale_name in {"mean_mst", "mean_mst_union", "mst_mean"}:
+            vals = np.asarray(mst_union.w, dtype=np.float64)
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            scale = float(np.mean(vals)) if vals.size else 1.0
+        elif scale_name in {"median_nn", "median_nn_union", "nn_median"}:
+            if points_for_scale is None:
+                scale = _positive_scale_from_values(mst_union.w, 0.5, default=1.0)
+                scale_name = "median_mst_union_fallback"
+            else:
+                scale = _median_nearest_neighbor_distance(points_for_scale)
+        else:
+            try:
+                scale = float(scale_spec)
+                scale_name = "numeric_string"
+            except ValueError as exc:
+                raise ValueError(
+                    "unknown exponential scale; use a positive number, "
+                    "'median_mst_union', 'p90_mst_union', 'mean_mst_union', "
+                    "or 'median_nn_union'"
+                ) from exc
+    else:
+        scale = float(scale_spec)
+        scale_name = "numeric"
+
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("exponential scale must be finite and positive")
+
+    half_life = bool(spec.get("half_life", True))
+    lam = float(np.log(2.0) / scale) if half_life else float(1.0 / scale)
+    return lam, {
+        "kernel": "exponential",
+        "lambda": lam,
+        "scale": float(scale),
+        "scale_source": scale_name,
+        "half_life": half_life,
+    }
+
+
+def _primitive_identity(t: np.ndarray | float) -> np.ndarray | float:
+    return t
+
+
+def _make_exponential_primitive(lam: float):
+    lam = float(lam)
+
+    def primitive(t: np.ndarray | float) -> np.ndarray | float:
+        arr = np.asarray(t, dtype=np.float64)
+        if lam == 0.0:
+            out = arr
+        else:
+            out = -np.expm1(-lam * arr) / lam
+        if np.ndim(t) == 0:
+            return float(out)
+        return out
+
+    return primitive
+
+
+def _radial_count_integral_from_mst(
+    mst: MSTResult,
+    R: float,
+    primitive: Callable[[Any], Any],
+) -> float:
+    """Integral of f(r) C_r dr, where primitive(t)=int_0^t f(r)dr."""
+    R = float(R)
+    if R < 0:
+        raise ValueError("R must be nonnegative")
+    if mst.n == 0:
+        return 0.0
+    weights = np.asarray(mst.w, dtype=np.float64)
+    F_R = float(primitive(R))
+    if weights.size == 0:
+        return F_R
+    return float(F_R + np.sum(primitive(np.minimum(weights, R)), dtype=np.float64))
+
+
+def _component_integral_from_mst(
+    mst: MSTResult,
+    R: float,
+    *,
+    kind: str,
+    alpha: float = 0.5,
+    min_size: int = 2,
+    primitive: Callable[[Any], Any] = _primitive_identity,
+) -> float:
+    """Integrate component-size functionals over the MST merge sweep."""
+    R = float(R)
+    if R < 0:
+        raise ValueError("R must be nonnegative")
+    n = int(mst.n)
+    if n == 0:
+        return 0.0
+
+    parent = np.arange(n, dtype=np.int64)
+    size = np.ones(n, dtype=np.int64)
+
+    def find(a: int) -> int:
+        a = int(a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = int(parent[a])
+        return a
+
+    kind = kind.lower().replace("-", "_")
+    if kind == "size_weighted":
+        alpha = float(alpha)
+        if not np.isfinite(alpha):
+            raise ValueError("alpha must be finite")
+        current = float(n)  # n * 1**alpha
+
+        def merge_delta(sa: int, sb: int) -> float:
+            return float((sa + sb) ** alpha - sa ** alpha - sb ** alpha)
+
+    elif kind == "min_size":
+        min_size = int(min_size)
+        if min_size < 1:
+            raise ValueError("min_size must be at least 1")
+        current = float(n if min_size <= 1 else 0)
+
+        def merge_delta(sa: int, sb: int) -> float:
+            return float(int(sa + sb >= min_size) - int(sa >= min_size) - int(sb >= min_size))
+
+    elif kind == "effective":
+        sum_s_log_s = 0.0
+        current = float(n)
+
+        def s_log_s(s: int) -> float:
+            return float(s) * float(np.log(float(s))) if s > 1 else 0.0
+
+        def merge_delta(sa: int, sb: int) -> float:
+            nonlocal sum_s_log_s, current
+            sum_s_log_s += s_log_s(sa + sb) - s_log_s(sa) - s_log_s(sb)
+            current = float(n * np.exp(-sum_s_log_s / n))
+            return 0.0
+
+    else:
+        raise ValueError("unknown component integral kind")
+
+    weights = np.asarray(mst.w, dtype=np.float64)
+    order = np.argsort(weights, kind="mergesort") if weights.size else np.empty(0, dtype=np.int64)
+
+    total = 0.0
+    prev = 0.0
+    pos = 0
+    m = order.size
+
+    while pos < m:
+        e0 = int(order[pos])
+        w = float(weights[e0])
+        if w > R:
+            break
+        if w > prev:
+            total += current * float(primitive(w) - primitive(prev))
+            prev = w
+
+        while pos < m and float(weights[int(order[pos])]) == w:
+            e = int(order[pos])
+            ra = find(int(mst.u[e]))
+            rb = find(int(mst.v[e]))
+            if ra != rb:
+                if size[ra] < size[rb]:
+                    ra, rb = rb, ra
+                sa = int(size[ra])
+                sb = int(size[rb])
+                parent[rb] = ra
+                size[ra] = sa + sb
+                if kind == "effective":
+                    merge_delta(sa, sb)
+                else:
+                    current += merge_delta(sa, sb)
+            pos += 1
+
+    if R > prev:
+        total += current * float(primitive(R) - primitive(prev))
+    return float(total)
+
+
+def _integral_from_mst_with_measure(
+    mst: MSTResult,
+    R: float,
+    measure: Any,
+    *,
+    mst_union_for_scale: Optional[MSTResult] = None,
+    points_for_scale: Optional[np.ndarray] = None,
+) -> tuple[float, str, dict[str, Any]]:
+    spec = _normalise_measure(measure)
+    kind = str(spec.get("kind", "plain"))
+    info: dict[str, Any] = {"kind": kind}
+
+    if kind == "plain":
+        return integral_from_mst(mst, R), kind, info
+
+    if kind == "exponential":
+        if mst_union_for_scale is None:
+            mst_union_for_scale = mst
+        lam, lam_info = _resolve_exponential_lambda(
+            spec, mst_union=mst_union_for_scale, points_for_scale=points_for_scale
+        )
+        info.update(lam_info)
+        primitive = _make_exponential_primitive(lam)
+        return _radial_count_integral_from_mst(mst, R, primitive), kind, info
+
+    if kind == "size_weighted":
+        alpha = float(spec.get("alpha", 0.5))
+        info["alpha"] = alpha
+        return _component_integral_from_mst(mst, R, kind="size_weighted", alpha=alpha), kind, info
+
+    if kind == "min_size":
+        min_size = int(spec.get("min_size", spec.get("minimum_size", 2)))
+        info["min_size"] = min_size
+        return _component_integral_from_mst(mst, R, kind="min_size", min_size=min_size), kind, info
+
+    if kind == "effective":
+        return _component_integral_from_mst(mst, R, kind="effective"), kind, info
+
+    raise ValueError(
+        "unknown measure kind. Supported kinds are: 'plain', 'exponential', "
+        "'size_weighted', 'min_size', and 'effective'."
+    )
+
+
+def similarity_integrals_from_msts(
+    mst_X: MSTResult,
+    mst_Y: MSTResult,
+    mst_union: MSTResult,
+    R: Optional[float] = None,
+    *,
+    measure: Any = "plain",
+    points_for_scale: Optional[np.ndarray] = None,
+    union_points: Optional[np.ndarray] = None,
+) -> SimilarityIntegrals:
+    """
+    Evaluate the similarity score from precomputed MSTs.
+
+    This is useful when the same linkage trees should be reused for several
+    measure modes. The result is dict-like and also supports legacy tuple
+    unpacking as I_X, I_Y, I_union, info.
+    """
+    if points_for_scale is None and union_points is not None:
+        points_for_scale = union_points
+    if R is None:
+        R = max(mst_X.max_edge, mst_Y.max_edge)
+    R = float(R)
+
+    I_X, kind, info = _integral_from_mst_with_measure(
+        mst_X, R, measure, mst_union_for_scale=mst_union, points_for_scale=points_for_scale
+    )
+    I_Y, _, _ = _integral_from_mst_with_measure(
+        mst_Y, R, measure, mst_union_for_scale=mst_union, points_for_scale=points_for_scale
+    )
+    I_union, _, _ = _integral_from_mst_with_measure(
+        mst_union, R, measure, mst_union_for_scale=mst_union, points_for_scale=points_for_scale
+    )
+    s = float("nan") if I_union == 0.0 else float((I_X + I_Y - I_union) / I_union)
+    return SimilarityIntegrals(
+        s=float(s),
+        R=float(R),
+        I_X=float(I_X),
+        I_Y=float(I_Y),
+        I_union=float(I_union),
+        measure_kind=str(kind),
+        measure_info=dict(info),
+    )
+
+
+def _compute_similarity_from_msts(
+    mst_X: MSTResult,
+    mst_Y: MSTResult,
+    mst_union: MSTResult,
+    *,
+    mst_common: MSTResult,
+    n_common: int,
+    x_unique: Optional[np.ndarray],
+    y_unique: Optional[np.ndarray],
+    x_unique_index: Optional[int] = None,
+    y_unique_index: Optional[int] = None,
+    measure: Any = "plain",
+    points_for_scale: Optional[np.ndarray] = None,
+) -> SimilarityResult:
+    vals = similarity_integrals_from_msts(
+        mst_X, mst_Y, mst_union, measure=measure, points_for_scale=points_for_scale
+    )
+    return SimilarityResult(
+        s=float(vals["s"]),
+        R=float(vals["R"]),
+        I_X=float(vals["I_X"]),
+        I_Y=float(vals["I_Y"]),
+        I_union=float(vals["I_union"]),
+        mst_X=mst_X,
+        mst_Y=mst_Y,
+        mst_union=mst_union,
+        mst_common=mst_common,
+        n_common=int(n_common),
+        x_unique=None if x_unique is None else np.asarray(x_unique, dtype=np.float64).copy(),
+        y_unique=None if y_unique is None else np.asarray(y_unique, dtype=np.float64).copy(),
+        x_unique_index=None if x_unique_index is None else int(x_unique_index),
+        y_unique_index=None if y_unique_index is None else int(y_unique_index),
+        measure_kind=str(vals["measure_kind"]),
+        measure_info=dict(vals["measure_info"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exact one-delete/one-add MST updates
+# ---------------------------------------------------------------------------
 
 
 def one_swap_msts_from_common(
@@ -522,10 +945,8 @@ def one_swap_msts_from_common(
     """
     Compute MST(X), MST(Y), MST(X union Y) in one sorted Kruskal pass.
 
-    Here X = A plus optional x and Y = A plus optional y.  The candidate edge
+    Here X = A plus optional x and Y = A plus optional y. The candidate edge
     set is MST(A), the star edges from inserted points to A, and the x-y edge.
-    The same sorted candidate stream is fed to three union-finds, avoiding three
-    separate sorts and avoiding repeated distance computation.
     """
     A = _as_points(common_points, "common_points")
     nA, dim = A.shape
@@ -549,7 +970,6 @@ def one_swap_msts_from_common(
     xU = nA if has_x else -1
     yU = nA + int(has_x) if has_y else -1
 
-    # Edge kind codes: 0=base A-A, 1=x-A, 2=y-A, 3=x-y.
     kind_parts = []
     a_parts = []
     b_parts = []
@@ -655,14 +1075,33 @@ def one_swap_msts_from_common(
     if len(outXw) != targetX or len(outYw) != targetY or len(outUw) != targetU:
         raise ValueError("candidate graph did not connect X, Y, or their union")
 
-    mst_X = MSTResult(nX, np.asarray(outXu, dtype=np.int64), np.asarray(outXv, dtype=np.int64), np.asarray(outXw, dtype=np.float64))
-    mst_Y = MSTResult(nY, np.asarray(outYu, dtype=np.int64), np.asarray(outYv, dtype=np.int64), np.asarray(outYw, dtype=np.float64))
-    mst_U = MSTResult(nU, np.asarray(outUu, dtype=np.int64), np.asarray(outUv, dtype=np.int64), np.asarray(outUw, dtype=np.float64))
+    mst_X = MSTResult(
+        nX,
+        np.asarray(outXu, dtype=np.int64),
+        np.asarray(outXv, dtype=np.int64),
+        np.asarray(outXw, dtype=np.float64),
+    )
+    mst_Y = MSTResult(
+        nY,
+        np.asarray(outYu, dtype=np.int64),
+        np.asarray(outYv, dtype=np.int64),
+        np.asarray(outYw, dtype=np.float64),
+    )
+    mst_U = MSTResult(
+        nU,
+        np.asarray(outUu, dtype=np.int64),
+        np.asarray(outUv, dtype=np.int64),
+        np.asarray(outUw, dtype=np.float64),
+    )
     return mst_X, mst_Y, mst_U
 
 
+# ---------------------------------------------------------------------------
+# Splitting / index-set APIs
+# ---------------------------------------------------------------------------
+
+
 def _row_key(row: np.ndarray) -> tuple:
-    # Exact multiset key.  Prefer index identities or ids for floating-point data.
     return tuple(np.asarray(row).tolist())
 
 
@@ -674,13 +1113,7 @@ def split_clouds_one_swap(
     ids_Y: Optional[Sequence[object]] = None,
     check_common_coordinates: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Return A, x, y with X = A plus optional x and Y = A plus optional y.
-
-    If ids_X/ids_Y are supplied, identity is based on ids.  Otherwise rows are
-    matched exactly as a multiset; this is fine for integer/exact coordinates,
-    but the index-set API is preferred for floating point data stored once.
-    """
+    """Return A, x, y with X = A plus optional x and Y = A plus optional y."""
     Xp = _as_points(X, "X")
     Yp = _as_points(Y, "Y")
     if Xp.shape[1] != Yp.shape[1]:
@@ -745,109 +1178,84 @@ def split_clouds_one_swap(
     if len(x_rows) > 1 or len(y_rows) > 1:
         raise ValueError(
             "X and Y differ by more than one deletion/insertion under exact row matching; "
-            "provide stable ids_X/ids_Y or use pointcloud_similarity_indices"
+            "provide stable ids_X/ids_Y if rows are floating-point copies"
         )
 
-    if common_rows:
-        A = np.vstack(common_rows).astype(np.float64, copy=False)
-    else:
-        A = np.empty((0, Xp.shape[1]), dtype=np.float64)
+    A = np.vstack(common_rows).astype(np.float64, copy=False) if common_rows else np.empty((0, Xp.shape[1]), dtype=np.float64)
     x = x_rows[0] if x_rows else None
     y = y_rows[0] if y_rows else None
     return A, x, y
 
 
-def _normalize_indices(indices: Sequence[int] | np.ndarray, n_points: int, name: str) -> np.ndarray:
-    """
-    Normalize an index set to a one-dimensional int64 array.
-
-    Integer arrays preserve their order.  Boolean masks are converted to
-    increasing integer indices.  Negative indices are rejected deliberately,
-    because these are set identities rather than Python slicing positions.
-    """
+def _normalise_index_array(indices: Sequence[int] | np.ndarray, n_points: int, name: str) -> np.ndarray:
     arr = np.asarray(indices)
     if arr.ndim != 1:
-        raise ValueError(f"{name} must be a one-dimensional integer index array or boolean mask")
+        raise ValueError(f"{name} must be one-dimensional")
     if arr.size == 0:
         return np.empty(0, dtype=np.int64)
-
-    if arr.dtype == np.bool_:
-        if arr.size != n_points:
-            raise ValueError(f"boolean mask {name} must have length len(points)")
-        idx = np.flatnonzero(arr).astype(np.int64, copy=False)
+    if not np.issubdtype(arr.dtype, np.integer):
+        as_float = arr.astype(np.float64)
+        if not np.all(np.isfinite(as_float)) or not np.all(as_float == np.floor(as_float)):
+            raise ValueError(f"{name} must contain integer indices")
+        arr = as_float.astype(np.int64)
     else:
-        if not np.issubdtype(arr.dtype, np.integer):
-            raise TypeError(f"{name} must contain integer indices, or be a boolean mask")
-        idx = arr.astype(np.int64, copy=False)
-
-    if np.any(idx < 0) or np.any(idx >= n_points):
-        raise IndexError(f"{name} contains an index outside [0, len(points))")
-
-    seen = np.zeros(n_points, dtype=np.bool_)
-    if idx.size:
-        seen[idx] = True
-        if int(seen.sum()) != idx.size:
-            raise ValueError(f"{name} contains duplicate indices")
-
-    return np.ascontiguousarray(idx, dtype=np.int64)
+        arr = arr.astype(np.int64, copy=False)
+    if np.any(arr < 0) or np.any(arr >= n_points):
+        raise IndexError(f"{name} contains an index outside [0, {n_points})")
+    if np.unique(arr).size != arr.size:
+        raise ValueError(f"{name} contains duplicate indices; pass point clouds as sets")
+    return np.ascontiguousarray(arr, dtype=np.int64)
 
 
-def split_indices_one_swap(
+def _normalise_optional_single_index(index: Optional[int], n_points: int, name: str) -> Optional[int]:
+    if index is None:
+        return None
+    if isinstance(index, np.generic):
+        index = index.item()
+    if not isinstance(index, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer index or None")
+    out = int(index)
+    if out < 0 or out >= n_points:
+        raise IndexError(f"{name} is outside [0, {n_points})")
+    return out
+
+
+def pointcloud_similarity_from_common_indices(
     points: np.ndarray,
-    indices_X: Sequence[int] | np.ndarray,
-    indices_Y: Sequence[int] | np.ndarray,
-) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray, Optional[int], Optional[int], np.ndarray, np.ndarray]:
-    """
-    Return A, x, y and the corresponding global indices for two index sets.
-
-    X = points[indices_X], Y = points[indices_Y].  The sets must differ by at
-    most one deletion and at most one insertion.  Common points are ordered as
-    they appear in indices_X.
-
-    Returns
-    -------
-    common_points, x, y, common_indices, x_index, y_index, indices_X, indices_Y
-    """
-    pts = _as_points(points, "points")
-    idx_X = _normalize_indices(indices_X, len(pts), "indices_X")
-    idx_Y = _normalize_indices(indices_Y, len(pts), "indices_Y")
-
-    in_X = np.zeros(len(pts), dtype=np.bool_)
-    in_Y = np.zeros(len(pts), dtype=np.bool_)
-    in_X[idx_X] = True
-    in_Y[idx_Y] = True
-
-    common_indices = idx_X[in_Y[idx_X]]
-    only_X = idx_X[~in_Y[idx_X]]
-    only_Y = idx_Y[~in_X[idx_Y]]
-
-    if only_X.size > 1 or only_Y.size > 1:
-        raise ValueError("indices_X and indices_Y differ by more than one deletion/insertion")
-
-    common_points = pts[common_indices].copy()
-    x = pts[int(only_X[0])].copy() if only_X.size else None
-    y = pts[int(only_Y[0])].copy() if only_Y.size else None
-    x_idx = int(only_X[0]) if only_X.size else None
-    y_idx = int(only_Y[0]) if only_Y.size else None
-    return common_points, x, y, common_indices.copy(), x_idx, y_idx, idx_X.copy(), idx_Y.copy()
-
-
-def _similarity_from_common_split(
-    A: np.ndarray,
-    x: Optional[np.ndarray],
-    y: Optional[np.ndarray],
+    common_indices: Sequence[int] | np.ndarray,
     *,
+    x_index: Optional[int] = None,
+    y_index: Optional[int] = None,
     mst_builder: Optional[Callable[[np.ndarray], MSTResult]] = None,
     mst_method: str = "auto",
-    common_indices: Optional[np.ndarray] = None,
-    x_unique_index: Optional[int] = None,
-    y_unique_index: Optional[int] = None,
-    indices_X: Optional[np.ndarray] = None,
-    indices_Y: Optional[np.ndarray] = None,
+    measure: Any = "plain",
     **mst_kwargs,
 ) -> SimilarityResult:
-    """Shared implementation once the common cloud and optional uniques are known."""
-    A = _as_points(A, "common_points")
+    """
+    Compute the similarity when X=A+optional x and Y=A+optional y.
+
+    measure="plain" preserves the original integral. Other supported modes are
+    "exponential", {"kind":"size_weighted", "alpha":0.5},
+    {"kind":"min_size", "min_size":m}, and "effective".
+    """
+    pts = _as_points(points, "points")
+    n_total = pts.shape[0]
+    common = _normalise_index_array(common_indices, n_total, "common_indices")
+    xi = _normalise_optional_single_index(x_index, n_total, "x_index")
+    yi = _normalise_optional_single_index(y_index, n_total, "y_index")
+
+    forbidden = set(map(int, common))
+    if xi is not None and xi in forbidden:
+        raise ValueError("x_index is already present in common_indices")
+    if yi is not None and yi in forbidden:
+        raise ValueError("y_index is already present in common_indices")
+    if xi is not None and yi is not None and xi == yi:
+        raise ValueError("x_index and y_index must be distinct")
+
+    A = pts[common]
+    x = None if xi is None else pts[xi]
+    y = None if yi is None else pts[yi]
+
     if mst_builder is None:
         common_mst = emst(A, method=mst_method, **mst_kwargs)
     else:
@@ -857,136 +1265,70 @@ def _similarity_from_common_split(
 
     mst_X, mst_Y, mst_union = one_swap_msts_from_common(A, common_mst, x, y)
 
-    R = max(mst_X.max_edge, mst_Y.max_edge)
-    I_X = integral_from_mst(mst_X, R)
-    I_Y = integral_from_mst(mst_Y, R)
-    I_union = integral_from_mst(mst_union, R)
-    s = float("nan") if I_union == 0.0 else (I_X + I_Y - I_union) / I_union
+    union_indices = list(map(int, common))
+    if xi is not None:
+        union_indices.append(xi)
+    if yi is not None:
+        union_indices.append(yi)
+    points_for_scale = pts[np.asarray(union_indices, dtype=np.int64)] if union_indices else None
 
-    return SimilarityResult(
-        s=float(s),
-        R=float(R),
-        I_X=float(I_X),
-        I_Y=float(I_Y),
-        I_union=float(I_union),
-        mst_X=mst_X,
-        mst_Y=mst_Y,
-        mst_union=mst_union,
+    return _compute_similarity_from_msts(
+        mst_X,
+        mst_Y,
+        mst_union,
         mst_common=common_mst,
         n_common=A.shape[0],
-        x_unique=None if x is None else np.asarray(x, dtype=np.float64).copy(),
-        y_unique=None if y is None else np.asarray(y, dtype=np.float64).copy(),
-        common_indices=None if common_indices is None else np.asarray(common_indices, dtype=np.int64).copy(),
-        x_unique_index=None if x_unique_index is None else int(x_unique_index),
-        y_unique_index=None if y_unique_index is None else int(y_unique_index),
-        indices_X=None if indices_X is None else np.asarray(indices_X, dtype=np.int64).copy(),
-        indices_Y=None if indices_Y is None else np.asarray(indices_Y, dtype=np.int64).copy(),
+        x_unique=x,
+        y_unique=y,
+        x_unique_index=xi,
+        y_unique_index=yi,
+        measure=measure,
+        points_for_scale=points_for_scale,
     )
 
 
-def pointcloud_similarity_indices(
+def pointcloud_similarity_index_sets(
     points: np.ndarray,
     indices_X: Sequence[int] | np.ndarray,
     indices_Y: Sequence[int] | np.ndarray,
     *,
     mst_builder: Optional[Callable[[np.ndarray], MSTResult]] = None,
     mst_method: str = "auto",
+    measure: Any = "plain",
     **mst_kwargs,
 ) -> SimilarityResult:
     """
     Compute s(X,Y) from one shared point array and two included-index sets.
 
-    This is the preferred API for streaming/sliding-window data.  For example,
-    if points[t] is the sample at time t, consecutive windows can be compared as
-
-        pointcloud_similarity_indices(points, np.arange(t, t+w), np.arange(t+1, t+w+1))
-
-    The two index sets must differ by at most one removed index and at most one
-    added index.  The computation is exact when the supplied/common-cloud MST
-    builder is exact.
+    The optimized path requires at most one index in X\\Y and at most one index
+    in Y\\X.
     """
     pts = _as_points(points, "points")
-    A, x, y, common_idx, x_idx, y_idx, idx_X, idx_Y = split_indices_one_swap(
-        pts, indices_X, indices_Y
-    )
-    return _similarity_from_common_split(
-        A,
-        x,
-        y,
+    idx_X = _normalise_index_array(indices_X, pts.shape[0], "indices_X")
+    idx_Y = _normalise_index_array(indices_Y, pts.shape[0], "indices_Y")
+
+    set_X = set(map(int, idx_X))
+    set_Y = set(map(int, idx_Y))
+    only_X = [int(i) for i in idx_X if int(i) not in set_Y]
+    only_Y = [int(i) for i in idx_Y if int(i) not in set_X]
+    if len(only_X) > 1 or len(only_Y) > 1:
+        raise ValueError(
+            "pointcloud_similarity_index_sets uses the one-delete/one-add fast path; "
+            "received more than one index in X\\Y or Y\\X"
+        )
+
+    common = np.asarray([int(i) for i in idx_X if int(i) in set_Y], dtype=np.int64)
+    return pointcloud_similarity_from_common_indices(
+        pts,
+        common,
+        x_index=only_X[0] if only_X else None,
+        y_index=only_Y[0] if only_Y else None,
         mst_builder=mst_builder,
         mst_method=mst_method,
-        common_indices=common_idx,
-        x_unique_index=x_idx,
-        y_unique_index=y_idx,
-        indices_X=idx_X,
-        indices_Y=idx_Y,
+        measure=measure,
         **mst_kwargs,
     )
 
-
-def _normalize_optional_index(index: Optional[int], n_points: int, name: str) -> Optional[int]:
-    """Normalize one optional global index."""
-    if index is None:
-        return None
-    arr = np.asarray(index)
-    if arr.shape != () or not np.issubdtype(arr.dtype, np.integer):
-        raise TypeError(f"{name} must be None or a single integer index")
-    idx = int(arr)
-    if idx < 0 or idx >= n_points:
-        raise IndexError(f"{name} is outside [0, len(points))")
-    return idx
-
-
-def pointcloud_similarity_from_common_indices(
-    points: np.ndarray,
-    common_indices: Sequence[int] | np.ndarray,
-    x_index: Optional[int] = None,
-    y_index: Optional[int] = None,
-    *,
-    mst_builder: Optional[Callable[[np.ndarray], MSTResult]] = None,
-    mst_method: str = "auto",
-    **mst_kwargs,
-) -> SimilarityResult:
-    """
-    Lower-level shared-array API for a known split X=A+x, Y=A+y.
-
-    This avoids recomputing the index-set intersection.  It is useful in
-    sliding-window loops, where common_indices is the overlap, x_index is the
-    leaving point, and y_index is the entering point.
-    """
-    pts = _as_points(points, "points")
-    common_idx = _normalize_indices(common_indices, len(pts), "common_indices")
-    x_idx = _normalize_optional_index(x_index, len(pts), "x_index")
-    y_idx = _normalize_optional_index(y_index, len(pts), "y_index")
-
-    in_common = np.zeros(len(pts), dtype=np.bool_)
-    in_common[common_idx] = True
-    if x_idx is not None and in_common[x_idx]:
-        raise ValueError("x_index is already in common_indices")
-    if y_idx is not None and in_common[y_idx]:
-        raise ValueError("y_index is already in common_indices")
-    if x_idx is not None and y_idx is not None and x_idx == y_idx:
-        raise ValueError("x_index and y_index must be distinct")
-
-    A = pts[common_idx].copy()
-    x = pts[x_idx].copy() if x_idx is not None else None
-    y = pts[y_idx].copy() if y_idx is not None else None
-    idx_X = common_idx.copy() if x_idx is None else np.r_[common_idx, np.asarray([x_idx], dtype=np.int64)]
-    idx_Y = common_idx.copy() if y_idx is None else np.r_[common_idx, np.asarray([y_idx], dtype=np.int64)]
-
-    return _similarity_from_common_split(
-        A,
-        x,
-        y,
-        mst_builder=mst_builder,
-        mst_method=mst_method,
-        common_indices=common_idx,
-        x_unique_index=x_idx,
-        y_unique_index=y_idx,
-        indices_X=idx_X,
-        indices_Y=idx_Y,
-        **mst_kwargs,
-    )
 
 def pointcloud_similarity_one_swap(
     X: np.ndarray,
@@ -996,39 +1338,127 @@ def pointcloud_similarity_one_swap(
     ids_Y: Optional[Sequence[object]] = None,
     mst_builder: Optional[Callable[[np.ndarray], MSTResult]] = None,
     mst_method: str = "auto",
+    measure: Any = "plain",
     **mst_kwargs,
 ) -> SimilarityResult:
     """
-    Compute s(X,Y) for two separate point arrays differing by one swap.
+    Compute s(X,Y) for point clouds differing by at most one deletion/insertion.
 
-    Prefer pointcloud_similarity_indices() when X and Y are subsets of one
-    shared global point array.  This compatibility wrapper still supports two
-    separate arrays, using ids_X/ids_Y when supplied and exact row matching
-    otherwise.
+    This is the original two-array API. For new code with one shared point
+    array, prefer pointcloud_similarity_index_sets().
     """
     Xp = _as_points(X, "X")
     Yp = _as_points(Y, "Y")
     A, x, y = split_clouds_one_swap(Xp, Yp, ids_X=ids_X, ids_Y=ids_Y)
-    return _similarity_from_common_split(
-        A,
-        x,
-        y,
-        mst_builder=mst_builder,
-        mst_method=mst_method,
-        **mst_kwargs,
+
+    if mst_builder is None:
+        common_mst = emst(A, method=mst_method, **mst_kwargs)
+    else:
+        common_mst = mst_builder(A)
+        if not isinstance(common_mst, MSTResult):
+            raise TypeError("mst_builder must return an MSTResult")
+
+    mst_X, mst_Y, mst_union = one_swap_msts_from_common(A, common_mst, x, y)
+
+    parts = [A]
+    if x is not None:
+        parts.append(np.asarray(x, dtype=np.float64).reshape(1, -1))
+    if y is not None:
+        parts.append(np.asarray(y, dtype=np.float64).reshape(1, -1))
+    points_for_scale = np.vstack(parts) if parts else None
+
+    return _compute_similarity_from_msts(
+        mst_X,
+        mst_Y,
+        mst_union,
+        mst_common=common_mst,
+        n_common=A.shape[0],
+        x_unique=x,
+        y_unique=y,
+        measure=measure,
+        points_for_scale=points_for_scale,
     )
 
 
-# Index-set API aliases.
-pointcloud_similarity_index_sets = pointcloud_similarity_indices
-pointcloud_similarity_from_indices = pointcloud_similarity_indices
-pointcloud_similarity_one_swap_indices = pointcloud_similarity_indices
-similarity_index_sets = pointcloud_similarity_indices
-similarity_indices = pointcloud_similarity_indices
+def weighted_integral_from_mst(
+    mst: MSTResult,
+    R: float,
+    *,
+    measure: Any = "exponential",
+    mst_union_for_scale: Optional[MSTResult] = None,
+    points_for_scale: Optional[np.ndarray] = None,
+) -> float:
+    """Evaluate any supported integral mode for a single MST.
 
-# Backwards-compatible array API alias.
+    For the original unweighted integral, call ``integral_from_mst(mst, R)``
+    or use ``measure="plain"``.
+    """
+    value, _, _ = _integral_from_mst_with_measure(
+        mst,
+        R,
+        measure,
+        mst_union_for_scale=mst if mst_union_for_scale is None else mst_union_for_scale,
+        points_for_scale=points_for_scale,
+    )
+    return float(value)
+
+
+def component_integral_from_mst(
+    mst: MSTResult,
+    R: float,
+    *,
+    kind: str = "size_weighted",
+    alpha: float = 0.5,
+    min_size: int = 2,
+) -> float:
+    """Compatibility helper for component-weighted integrals.
+
+    Supported ``kind`` values are ``"size_weighted"``, ``"min_size"``,
+    and ``"effective"``.
+    """
+    return _component_integral_from_mst(
+        mst,
+        R,
+        kind=kind,
+        alpha=alpha,
+        min_size=min_size,
+    )
+
+
+# Backwards-friendly aliases.
 similarity_one_swap = pointcloud_similarity_one_swap
-similarity_one_swap_indices = pointcloud_similarity_indices
+pointcloud_similarity_indices = pointcloud_similarity_index_sets
+pointcloud_similarity_from_indices = pointcloud_similarity_index_sets
+pointcloud_similarity_one_swap_indices = pointcloud_similarity_index_sets
+similarity_index_sets = pointcloud_similarity_index_sets
+similarity_indices = pointcloud_similarity_index_sets
+
+
+__all__ = [
+    "__version__",
+    "MSTResult",
+    "SimilarityResult",
+    "SimilarityIntegrals",
+    "UnionFind",
+    "kruskal_mst",
+    "emst",
+    "emst_delaunay",
+    "emst_boruvka_ckdtree",
+    "mst_with_inserted_points",
+    "integral_from_mst",
+    "similarity_integrals_from_msts",
+    "weighted_integral_from_mst",
+    "component_integral_from_mst",
+    "pointcloud_similarity_index_sets",
+    "pointcloud_similarity_indices",
+    "pointcloud_similarity_from_indices",
+    "pointcloud_similarity_one_swap_indices",
+    "pointcloud_similarity_from_common_indices",
+    "pointcloud_similarity_one_swap",
+    "similarity_index_sets",
+    "similarity_indices",
+    "similarity_one_swap",
+]
 
 
 if __name__ == "__main__":
@@ -1036,8 +1466,7 @@ if __name__ == "__main__":
     A = rng.normal(size=(100, 2))
     x = np.array([[3.0, 0.0]])
     y = np.array([[-3.0, 0.0]])
-    points = np.vstack([A, x, y])
-    idx_X = np.r_[np.arange(len(A)), len(A)]
-    idx_Y = np.r_[np.arange(len(A)), len(A) + 1]
-    ans = pointcloud_similarity_indices(points, idx_X, idx_Y, mst_method="auto")
+    X = np.vstack([A, x])
+    Y = np.vstack([A, y])
+    ans = pointcloud_similarity_one_swap(X, Y, mst_method="auto")
     print(f"s={ans.s:.8f}, R={ans.R:.8f}, I_union={ans.I_union:.8f}")
